@@ -1,0 +1,409 @@
+<!doctype html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>鼻歌スコア表示（ピッチ検出プロトタイプ）</title>
+  <style>
+    :root {
+      font-family: "Helvetica Neue", Arial, sans-serif;
+      background: #0f1624;
+      color: #e9f1ff;
+      line-height: 1.6;
+    }
+    body {
+      margin: 0;
+      padding: 24px;
+      display: flex;
+      justify-content: center;
+    }
+    .card {
+      width: min(960px, 100%);
+      background: #111a2b;
+      border: 1px solid #20304a;
+      border-radius: 16px;
+      padding: 24px;
+      box-shadow: 0 12px 32px rgba(0,0,0,0.35);
+    }
+    h1 { margin-top: 0; }
+    button {
+      padding: 10px 16px;
+      margin-right: 8px;
+      border: none;
+      border-radius: 8px;
+      background: #3c7dff;
+      color: #fff;
+      font-weight: 600;
+      cursor: pointer;
+      transition: background 0.15s ease, transform 0.1s ease;
+    }
+    button:hover { background: #558cff; }
+    button:active { transform: translateY(1px); }
+    button[disabled] { background: #2c3b5a; cursor: not-allowed; }
+    .metrics {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
+      gap: 12px;
+      margin: 16px 0;
+    }
+    .metric {
+      padding: 12px;
+      border: 1px solid #20304a;
+      border-radius: 12px;
+      background: #0d1421;
+    }
+    .metric .label { color: #7da5ff; font-size: 13px; }
+    .metric .value { font-size: 24px; font-variant-numeric: tabular-nums; }
+    .log {
+      background: #0a101b;
+      border: 1px solid #20304a;
+      border-radius: 12px;
+      padding: 12px;
+      min-height: 80px;
+      font-family: "SFMono-Regular", Menlo, Consolas, monospace;
+      font-size: 13px;
+      white-space: pre-wrap;
+    }
+    .status {
+      padding: 8px 0;
+      color: #9fb8ff;
+    }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <h1>鼻歌ピッチ検出プロトタイプ</h1>
+    <p>マイク許可後、リアルタイムで基本周波数を推定します（YIN, AudioWorklet ベース）。</p>
+    <div>
+      <button id="startBtn">開始</button>
+      <button id="stopBtn" disabled>停止</button>
+    </div>
+    <div class="status" id="status">待機中...</div>
+    <div class="metrics">
+      <div class="metric">
+        <div class="label">推定周波数</div>
+        <div class="value" id="freqValue">-- Hz</div>
+      </div>
+      <div class="metric">
+        <div class="label">MIDI</div>
+        <div class="value" id="midiValue">--</div>
+      </div>
+      <div class="metric">
+        <div class="label">信頼度</div>
+        <div class="value" id="confValue">--</div>
+      </div>
+      <div class="metric">
+        <div class="label">音階（現在）</div>
+        <div class="value" id="noteValue">--</div>
+      </div>
+      <div class="metric">
+        <div class="label">推定キー（最近3秒）</div>
+        <div class="value" id="keyValue">--</div>
+      </div>
+    </div>
+    <div class="log" id="log"></div>
+  </div>
+  <script type="module">
+    const startBtn = document.getElementById('startBtn');
+    const stopBtn = document.getElementById('stopBtn');
+    const statusEl = document.getElementById('status');
+    const freqEl = document.getElementById('freqValue');
+    const midiEl = document.getElementById('midiValue');
+    const confEl = document.getElementById('confValue');
+    const noteEl = document.getElementById('noteValue');
+    const keyEl = document.getElementById('keyValue');
+    const logEl = document.getElementById('log');
+
+    let audioCtx;
+    let mediaStream;
+    let sourceNode;
+    let workletNode;
+    let fallbackProcessor;
+    let zeroGain;
+    const windowMs = 3000; // 推定キーの窓サイズ
+    const midiHistory = [];
+    // 平滑化用: 直近サンプルの単純移動平均で滑らかにする
+    const freqWindow = [];
+    const windowSize = 201; // 大きいほど滑らかだが反応は遅くなる
+
+    function log(msg) {
+      const time = new Date().toLocaleTimeString();
+      logEl.textContent = `[${time}] ${msg}\n` + logEl.textContent.slice(0, 2000);
+    }
+
+    function formatFreq(f) {
+      return f ? `${f.toFixed(1)} Hz` : '-- Hz';
+    }
+    function formatMidi(midi) {
+      return Number.isFinite(midi) ? midi.toFixed(2) : '--';
+    }
+    function formatConf(c) {
+      return Number.isFinite(c) ? (c * 100).toFixed(1) + '%' : '--';
+    }
+    function formatNote(semitone) {
+      if (!Number.isFinite(semitone)) return '--';
+      const nearest = Math.round(semitone);
+      const cents = (semitone - nearest) * 100;
+      const sign = cents >= 0 ? '+' : '';
+      return `${midiToNoteName(nearest)} (${sign}${cents.toFixed(1)}c)`;
+    }
+    function freqToSemitone(freq) {
+      return 69 + 12 * Math.log2(freq / 440);
+    }
+
+    async function start() {
+      if (audioCtx) return;
+      log('開始ボタンが押されました');
+      startBtn.disabled = true;
+      statusEl.textContent = 'マイク許可を待っています...';
+
+      if (location.protocol !== 'https:' && location.hostname !== 'localhost') {
+        log('警告: マイク取得には https または localhost からのアクセスが必要です。');
+      }
+
+      try {
+        mediaStream = await navigator.mediaDevices.getUserMedia({
+          audio: {
+            echoCancellation: false,
+            noiseSuppression: false,
+            autoGainControl: false
+          }
+        });
+      } catch (err) {
+        statusEl.textContent = 'マイク許可が得られませんでした';
+        log(`マイク取得失敗: ${err}`);
+        startBtn.disabled = false;
+        return;
+      }
+
+      audioCtx = new AudioContext({ latencyHint: 'interactive' });
+      if (audioCtx.state === 'suspended') {
+        try {
+          await audioCtx.resume();
+          log('AudioContext を resume しました');
+        } catch (err) {
+          log(`AudioContext resume に失敗: ${err}`);
+        }
+      }
+      sourceNode = audioCtx.createMediaStreamSource(mediaStream);
+      zeroGain = audioCtx.createGain();
+      zeroGain.gain.value = 0;
+
+      if (audioCtx.audioWorklet) {
+        try {
+          const workletUrl = await loadWorkletAsBlobUrl('pitch-worklet.js');
+          await audioCtx.audioWorklet.addModule(workletUrl);
+          workletNode = new AudioWorkletNode(audioCtx, 'pitch-processor');
+          workletNode.port.onmessage = (event) => handleResult(event.data);
+          sourceNode.connect(workletNode).connect(zeroGain).connect(audioCtx.destination);
+          statusEl.textContent = 'AudioWorklet で計測中...';
+          log('AudioWorklet で開始しました');
+        } catch (err) {
+          log(`AudioWorklet 読み込み失敗: ${err}. ScriptProcessor にフォールバックします。`);
+          statusEl.textContent = 'Worklet 読み込み失敗、フォールバック中...';
+          setupFallback();
+        }
+      } else {
+        log('AudioWorklet 非対応。ScriptProcessor にフォールバックします。');
+        setupFallback();
+      }
+
+      stopBtn.disabled = false;
+    }
+
+    async function loadWorkletAsBlobUrl(path) {
+      const res = await fetch(path, { cache: 'no-cache' });
+      if (!res.ok) throw new Error(`Worklet fetch failed: ${res.status}`);
+      const text = await res.text();
+      const blob = new Blob([text], { type: 'application/javascript' });
+      return URL.createObjectURL(blob);
+    }
+
+    function setupFallback() {
+      const processor = audioCtx.createScriptProcessor(2048, 1, 1);
+      const frameSize = 2048;
+      const hopSize = 512;
+      const buffer = [];
+      processor.onaudioprocess = (event) => {
+        const input = event.inputBuffer.getChannelData(0);
+        for (let i = 0; i < input.length; i++) buffer.push(input[i]);
+        while (buffer.length >= frameSize) {
+          const frame = buffer.slice(0, frameSize);
+          const res = detectYin(frame, audioCtx.sampleRate);
+          handleResult({
+            frequencyHz: res.frequency,
+            midi: res.frequency ? 69 + 12 * Math.log2(res.frequency / 440) : null,
+            confidence: res.confidence,
+            timestamp: audioCtx.currentTime * 1000
+          });
+          buffer.splice(0, hopSize);
+        }
+      };
+      fallbackProcessor = processor;
+      sourceNode.connect(processor).connect(zeroGain).connect(audioCtx.destination);
+      statusEl.textContent = 'ScriptProcessor で計測中...（遅延多め）';
+    }
+
+    function stop() {
+      if (!audioCtx) return;
+      if (workletNode) {
+        workletNode.disconnect();
+        workletNode = null;
+      }
+      if (fallbackProcessor) {
+        fallbackProcessor.disconnect();
+        fallbackProcessor = null;
+      }
+      if (sourceNode) {
+        sourceNode.disconnect();
+        sourceNode = null;
+      }
+      if (zeroGain) {
+        zeroGain.disconnect();
+        zeroGain = null;
+      }
+      audioCtx.close();
+      audioCtx = null;
+      if (mediaStream) {
+        mediaStream.getTracks().forEach((t) => t.stop());
+        mediaStream = null;
+      }
+      statusEl.textContent = '停止しました';
+      startBtn.disabled = false;
+      stopBtn.disabled = true;
+      log('停止しました');
+    }
+
+    function handleResult(data) {
+      const { frequencyHz, midi, confidence } = data;
+      const smoothedFreq = smoothFreq(frequencyHz);
+      freqEl.textContent = formatFreq(smoothedFreq);
+      const semitone = smoothedFreq ? freqToSemitone(smoothedFreq) : null;
+      midiEl.textContent = formatMidi(semitone); // 表示用に計算するが、処理は周波数基準
+      confEl.textContent = formatConf(confidence);
+      noteEl.textContent = formatNote(semitone);
+      statusEl.textContent = frequencyHz ? '検出中...' : '入力が弱いか検出不能です';
+      updateKeyEstimate(semitone, data.timestamp);
+    }
+
+    function smoothFreq(frequencyHz) {
+      if (!Number.isFinite(frequencyHz)) {
+        freqWindow.length = 0;
+        return null;
+      }
+      freqWindow.push(frequencyHz);
+      if (freqWindow.length > windowSize) freqWindow.shift();
+      const sum = freqWindow.reduce((a, b) => a + b, 0);
+      return sum / freqWindow.length;
+    }
+
+    function updateKeyEstimate(semitone, timestampMs) {
+      const now = timestampMs ?? performance.now();
+      if (Number.isFinite(semitone)) {
+        midiHistory.push({ midi: semitone, t: now });
+      }
+      // 古いデータを削除
+      while (midiHistory.length && now - midiHistory[0].t > windowMs) {
+        midiHistory.shift();
+      }
+      if (midiHistory.length === 0) {
+        keyEl.textContent = '--';
+        return;
+      }
+      // 最頻値をとる（半音単位で丸め）
+      const counts = new Map();
+      for (const item of midiHistory) {
+        const rounded = Math.round(item.midi);
+        counts.set(rounded, (counts.get(rounded) ?? 0) + 1);
+      }
+      let bestMidi = null;
+      let bestCount = -1;
+      for (const [m, c] of counts.entries()) {
+        if (c > bestCount) {
+          bestCount = c;
+          bestMidi = m;
+        }
+      }
+      if (bestMidi === null) {
+        keyEl.textContent = '--';
+        return;
+      }
+      const note = midiToNoteName(bestMidi);
+      keyEl.textContent = note;
+    }
+
+
+    function midiToNoteName(m) {
+      const names = ['C', 'C#', 'D', 'D#', 'E', 'F', 'F#', 'G', 'G#', 'A', 'A#', 'B'];
+      const octave = Math.floor(m / 12) - 1;
+      const name = names[(Math.round(m) % 12 + 12) % 12];
+      return `${name}${octave}`;
+    }
+
+    // YIN detection for fallback
+    function detectYin(frame, sampleRate) {
+      const frameSize = frame.length;
+      const yinSize = Math.floor(frameSize / 2);
+      const yin = new Float32Array(yinSize);
+      let energy = 0;
+      for (let i = 0; i < frameSize; i++) {
+        energy += frame[i] * frame[i];
+      }
+      const rms = Math.sqrt(energy / frameSize);
+      if (rms < 0.0002) return { frequency: null, confidence: 0 };
+
+      for (let tau = 1; tau < yinSize; tau++) {
+        let sum = 0;
+        for (let i = 0; i < frameSize - tau; i++) {
+          const delta = frame[i] - frame[i + tau];
+          sum += delta * delta;
+        }
+        yin[tau] = sum;
+      }
+
+      yin[0] = 1;
+      let runningSum = 0;
+      for (let tau = 1; tau < yinSize; tau++) {
+        runningSum += yin[tau];
+        yin[tau] = yin[tau] * tau / runningSum;
+      }
+
+      const threshold = 0.12;
+      let tauEstimate = -1;
+      for (let tau = 2; tau < yinSize; tau++) {
+        if (yin[tau] < threshold) {
+          while (tau + 1 < yinSize && yin[tau + 1] < yin[tau]) tau++;
+          tauEstimate = tau;
+          break;
+        }
+      }
+      if (tauEstimate === -1) {
+        let minVal = Infinity;
+        for (let tau = 2; tau < yinSize; tau++) {
+          if (yin[tau] < minVal) {
+            minVal = yin[tau];
+            tauEstimate = tau;
+          }
+        }
+      }
+
+      let betterTau = tauEstimate;
+      if (tauEstimate > 0 && tauEstimate < yinSize - 1) {
+        const s0 = yin[tauEstimate - 1];
+        const s1 = yin[tauEstimate];
+        const s2 = yin[tauEstimate + 1];
+        const shift = (s2 - s0) / (2 * (2 * s1 - s2 - s0));
+        betterTau = tauEstimate + shift;
+      }
+
+      const freq = sampleRate / betterTau;
+      if (freq < 80 || freq > 800) return { frequency: null, confidence: 0 };
+      const confidence = 1 - yin[tauEstimate];
+      return { frequency: freq, confidence };
+    }
+
+    startBtn.addEventListener('click', start);
+    stopBtn.addEventListener('click', stop);
+  </script>
+</body>
+</html>
