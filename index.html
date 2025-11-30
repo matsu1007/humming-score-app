@@ -382,7 +382,7 @@
         yin[tau] = yin[tau] * tau / runningSum;
       }
 
-      const threshold = 0.12;
+      const threshold = 0.08;
       let tauEstimate = -1;
       for (let tau = 2; tau < yinSize; tau++) {
         if (yin[tau] < threshold) {

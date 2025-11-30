@@ -8,7 +8,7 @@ class PitchProcessor extends AudioWorkletProcessor {
     this.hopSize = 256;
     this.minFreq = 80;
     this.maxFreq = 800;
-    this.threshold = 0.12;
+    this.threshold = 0.08;
     this.energyThreshold = 0.0002;
     this.buffer = [];
   }
