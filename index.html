@@ -203,24 +203,26 @@
       zeroGain = audioCtx.createGain();
       zeroGain.gain.value = 0;
 
-      if (audioCtx.audioWorklet) {
-        try {
-          const workletUrl = await loadWorkletAsBlobUrl('pitch-worklet.js');
-          await audioCtx.audioWorklet.addModule(workletUrl);
-          workletNode = new AudioWorkletNode(audioCtx, 'pitch-processor');
-          workletNode.port.onmessage = (event) => handleResult(event.data);
-          sourceNode.connect(workletNode).connect(zeroGain).connect(audioCtx.destination);
-          statusEl.textContent = 'AudioWorklet で計測中...';
-          log('AudioWorklet で開始しました');
-        } catch (err) {
-          log(`AudioWorklet 読み込み失敗: ${err}. ScriptProcessor にフォールバックします。`);
-          statusEl.textContent = 'Worklet 読み込み失敗、フォールバック中...';
-          setupFallback();
-        }
-      } else {
-        log('AudioWorklet 非対応。ScriptProcessor にフォールバックします。');
+    const preferWorkletOnly = false; // GitHub Pages など HTTPS 上で Worklet を優先しつつ、失敗時はフォールバック
+
+    if (audioCtx.audioWorklet) {
+      try {
+        const workletUrl = await loadWorkletAsBlobUrl('pitch-worklet.js');
+        await audioCtx.audioWorklet.addModule(workletUrl);
+        workletNode = new AudioWorkletNode(audioCtx, 'pitch-processor');
+        workletNode.port.onmessage = (event) => handleResult(event.data);
+        sourceNode.connect(workletNode).connect(zeroGain).connect(audioCtx.destination);
+        statusEl.textContent = 'AudioWorklet で計測中...';
+        log('AudioWorklet で開始しました');
+      } catch (err) {
+        log(`AudioWorklet 読み込み失敗: ${err}. ScriptProcessor にフォールバックします。`);
+        statusEl.textContent = 'Worklet 読み込み失敗、フォールバック中...';
         setupFallback();
       }
+    } else {
+      log('AudioWorklet 非対応。ScriptProcessor にフォールバックします。');
+      setupFallback();
+    }
 
       stopBtn.disabled = false;
     }
